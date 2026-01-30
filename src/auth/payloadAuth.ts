@@ -1,0 +1,207 @@
+/**
+ * PayloadCMS Authentication
+ * Validates user credentials against PayloadCMS backend
+ */
+
+interface PayloadAuthResponse {
+  success: boolean;
+  user?: {
+    id: string;
+    email: string;
+    token: string;
+  };
+  error?: string;
+}
+
+interface PayloadLoginResponse {
+  user: {
+    id: string;
+    email: string;
+  };
+  token: string;
+}
+
+interface PayloadErrorResponse {
+  errors?: Array<{
+    message: string;
+  }>;
+}
+
+interface PayloadMeResponse {
+  user: {
+    id: string;
+    email: string;
+  };
+}
+
+const PAYLOAD_URL = process.env.PAYLOAD_URL || 'https://cashchat.supastellar.dev';
+
+/**
+ * Authenticate user with PayloadCMS
+ */
+export async function authenticateWithPayload(
+  email: string,
+  password: string
+): Promise<PayloadAuthResponse> {
+  try {
+    // If password is empty, it might be a Google OAuth user
+    // Try to find user by email first
+    if (!password) {
+      return await findUserByEmail(email);
+    }
+
+    const response = await fetch(`${PAYLOAD_URL}/api/users/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ email, password }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as PayloadErrorResponse;
+      return {
+        success: false,
+        error: errorData.errors?.[0]?.message || 'Invalid email or password',
+      };
+    }
+
+    const data = await response.json() as PayloadLoginResponse;
+
+    if (!data.user || !data.token) {
+      return {
+        success: false,
+        error: 'Invalid response from authentication service',
+      };
+    }
+
+    return {
+      success: true,
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+        token: data.token,
+      },
+    };
+  } catch (error) {
+    console.error('PayloadCMS auth error:', error);
+    return {
+      success: false,
+      error: 'Authentication service unavailable',
+    };
+  }
+}
+
+/**
+ * Find user by email (for OAuth flows where we don't have password)
+ */
+async function findUserByEmail(email: string): Promise<PayloadAuthResponse> {
+  try {
+    // Use PayloadCMS API to query users by email
+    // Note: This requires an API key or admin authentication
+    const apiKey = process.env.CASHCHAT_API_KEY;
+
+    if (!apiKey) {
+      return {
+        success: false,
+        error: 'Server configuration error',
+      };
+    }
+
+    const response = await fetch(
+      `${PAYLOAD_URL}/api/users?where[email][equals]=${encodeURIComponent(email)}&limit=1`,
+      {
+        headers: {
+          'Authorization': `users API-Key ${apiKey}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      return {
+        success: false,
+        error: 'Failed to find user account',
+      };
+    }
+
+    const data = await response.json() as { docs: Array<{ id: string; email: string }> };
+
+    if (!data.docs || data.docs.length === 0) {
+      return {
+        success: false,
+        error: 'No account found with this email',
+      };
+    }
+
+    const user = data.docs[0];
+
+    return {
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        token: '', // OAuth flow doesn't need PayloadCMS token
+      },
+    };
+  } catch (error) {
+    console.error('User lookup error:', error);
+    return {
+      success: false,
+      error: 'Failed to verify user account',
+    };
+  }
+}
+
+/**
+ * Verify a PayloadCMS JWT token
+ */
+export async function verifyPayloadToken(token: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${PAYLOAD_URL}/api/users/me`, {
+      headers: {
+        'Authorization': `JWT ${token}`,
+      },
+    });
+
+    return response.ok;
+  } catch (error) {
+    console.error('Token verification error:', error);
+    return false;
+  }
+}
+
+/**
+ * Get user info from PayloadCMS token
+ */
+export async function getPayloadUser(token: string): Promise<PayloadAuthResponse> {
+  try {
+    const response = await fetch(`${PAYLOAD_URL}/api/users/me`, {
+      headers: {
+        'Authorization': `JWT ${token}`,
+      },
+    });
+
+    if (!response.ok) {
+      return {
+        success: false,
+        error: 'Invalid or expired token',
+      };
+    }
+
+    const data = await response.json() as PayloadMeResponse;
+
+    return {
+      success: true,
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+        token,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: 'Failed to fetch user info',
+    };
+  }
+}
