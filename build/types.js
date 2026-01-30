@@ -1,0 +1,2 @@
+// CashChat API Types
+export {};

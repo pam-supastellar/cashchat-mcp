@@ -1,0 +1,16 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "node build/server.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[env]
+# These should be set in Railway dashboard:
+# CASHCHAT_API_KEY (required)
+# SERVER_URL (required for OAuth)
+# OAUTH_CLIENT_ID (optional, defaults to cashchat-mcp-server)
+# OAUTH_CLIENT_SECRET (recommended for production)
