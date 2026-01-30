@@ -8,10 +8,13 @@ const PAYLOAD_URL = process.env.PAYLOAD_URL || 'https://cashchat.supastellar.dev
  */
 export async function authenticateWithPayload(email, password) {
     try {
-        // If password is empty, it might be a Google OAuth user
-        // Try to find user by email first
+        // SECURITY: Always require password for email/password authentication
+        // OAuth users should use a different authentication flow
         if (!password) {
-            return await findUserByEmail(email);
+            return {
+                success: false,
+                error: 'Password is required for email/password authentication',
+            };
         }
         const response = await fetch(`${PAYLOAD_URL}/api/users/login`, {
             method: 'POST',
@@ -54,7 +57,7 @@ export async function authenticateWithPayload(email, password) {
 /**
  * Find user by email (for OAuth flows where we don't have password)
  */
-async function findUserByEmail(email) {
+export async function findUserByEmail(email) {
     try {
         // Use PayloadCMS API to query users by email
         // Note: This requires an API key or admin authentication

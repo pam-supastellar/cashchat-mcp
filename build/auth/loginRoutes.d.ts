@@ -11,6 +11,7 @@ declare module 'express-session' {
             code_challenge_method: string;
         };
         csrfToken?: string;
+        googleOAuthState?: string;
     }
 }
 export default router;

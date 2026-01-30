@@ -16,6 +16,10 @@ interface PayloadAuthResponse {
  */
 export declare function authenticateWithPayload(email: string, password: string): Promise<PayloadAuthResponse>;
 /**
+ * Find user by email (for OAuth flows where we don't have password)
+ */
+export declare function findUserByEmail(email: string): Promise<PayloadAuthResponse>;
+/**
  * Verify a PayloadCMS JWT token
  */
 export declare function verifyPayloadToken(token: string): Promise<boolean>;

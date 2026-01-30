@@ -15,6 +15,7 @@ export interface AuthorizationCode {
     scopes: string[];
     expiresAt: Date;
     createdAt: Date;
+    consumed: boolean;
 }
 /**
  * Generate a new authorization code

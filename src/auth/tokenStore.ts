@@ -23,6 +23,7 @@ export interface AuthorizationCode {
   scopes: string[];
   expiresAt: Date;
   createdAt: Date;
+  consumed: boolean; // Replay protection
 }
 
 // In-memory storage (replace with database in production)
@@ -56,6 +57,7 @@ export function createAuthorizationCode(params: {
     scopes: params.scopes,
     expiresAt: new Date(Date.now() + CODE_EXPIRY_MS),
     createdAt: new Date(),
+    consumed: false, // Initialize as not consumed
   };
 
   authorizationCodes.set(code, authCode);
@@ -81,6 +83,16 @@ export function consumeAuthorizationCode(
     return null;
   }
 
+  // SECURITY: Delete code IMMEDIATELY to prevent race condition attacks
+  // This must happen BEFORE any validation to ensure atomic consumption
+  authorizationCodes.delete(code);
+
+  // Check if already consumed (replay protection)
+  if (authCode.consumed) {
+    console.error('Authorization code replay attempt detected:', code);
+    return null;
+  }
+
   // Check expiry
   if (authCode.expiresAt < new Date()) {
     authorizationCodes.delete(code);
@@ -92,16 +104,26 @@ export function consumeAuthorizationCode(
     return null;
   }
 
-  // Verify PKCE if present
-  if (authCode.codeChallenge && codeVerifier) {
-    const hash = createHash('sha256').update(codeVerifier).digest('base64url');
-    if (hash !== authCode.codeChallenge) {
-      return null;
-    }
+  // ENFORCE PKCE - must be present for public clients
+  if (!authCode.codeChallenge || !codeVerifier) {
+    console.error('PKCE required but not provided');
+    return null;
   }
 
-  // Code is valid - consume it (one-time use)
-  authorizationCodes.delete(code);
+  // Verify PKCE (only S256 method supported)
+  if (authCode.codeChallengeMethod !== 'S256') {
+    console.error('Only S256 PKCE method supported');
+    return null;
+  }
+
+  const hash = createHash('sha256').update(codeVerifier).digest('base64url');
+  if (hash !== authCode.codeChallenge) {
+    console.error('PKCE validation failed');
+    return null;
+  }
+
+  // Mark as consumed (replay protection)
+  authCode.consumed = true;
 
   return authCode;
 }

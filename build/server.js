@@ -18,30 +18,75 @@
  */
 import express from 'express';
 import cors from 'cors';
+import session from 'express-session';
+import rateLimit from 'express-rate-limit';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { registerTransactionTools } from './tools/transactions.js';
 import { registerSummaryTools } from './tools/summary.js';
 import oauthRoutes from './auth/oauthRoutes.js';
+import loginRoutes from './auth/loginRoutes.js';
 import { requireAuth } from './auth/middleware.js';
 // Configuration
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
+// SECURITY: Require SESSION_SECRET environment variable
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET) {
+    console.error('FATAL: SESSION_SECRET environment variable is required');
+    console.error('Generate a secure secret with: openssl rand -base64 32');
+    process.exit(1);
+}
+if (SESSION_SECRET.length < 32) {
+    console.error('FATAL: SESSION_SECRET must be at least 32 characters long');
+    console.error('Generate a secure secret with: openssl rand -base64 32');
+    process.exit(1);
+}
 // Create Express app
 const app = express();
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+// SECURITY: Trust proxy to get correct client IP for rate limiting
+// Set to 1 if behind a single proxy (nginx, cloudflare, etc.)
+app.set('trust proxy', 1);
+// Session middleware (required for OAuth login flow)
+app.use(session({
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+        httpOnly: true,
+        maxAge: 15 * 60 * 1000, // 15 minutes
+        sameSite: 'strict', // SECURITY: Prevent CSRF attacks with strict same-site policy
+    },
+}));
+// Rate limiting for OAuth endpoints
+const oauthLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 20, // 20 requests per window
+    message: {
+        error: 'too_many_requests',
+        error_description: 'Too many authorization attempts, please try again later',
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',
-        version: '1.0.0',
+        version: '2.0.0',
         serverUrl: SERVER_URL,
+        features: ['oauth2', 'pkce', 'payload-auth', 'rate-limiting'],
     });
 });
-// OAuth routes (public - no auth required)
+// OAuth routes with rate limiting
+// Login routes (authorize + login endpoints with user authentication)
+app.use('/oauth', oauthLimiter, loginRoutes);
+// Token endpoint (from oauthRoutes.ts - token exchange)
 app.use('/oauth', oauthRoutes);
 // OAuth metadata endpoint (required by Claude Desktop)
 app.get('/.well-known/oauth-authorization-server', (req, res) => {

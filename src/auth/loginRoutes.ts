@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { authenticateWithPayload } from './payloadAuth.js';
+import { authenticateWithPayload, findUserByEmail } from './payloadAuth.js';
 import { createAuthorizationCode } from './tokenStore.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -32,6 +32,7 @@ declare module 'express-session' {
       code_challenge_method: string;
     };
     csrfToken?: string;
+    googleOAuthState?: string; // Store Google OAuth state for CSRF protection
   }
 }
 
@@ -184,40 +185,59 @@ router.post('/login', async (req: Request, res: Response) => {
     });
   }
 
-  // Extract OAuth params from session
-  const {
-    client_id,
-    redirect_uri,
-    scope,
-    state,
-    code_challenge,
-    code_challenge_method,
-  } = req.session.oauthParams;
+  // Store OAuth params and user ID before regenerating session
+  const oauthParams = req.session.oauthParams;
+  const userId = authResult.user.id;
 
-  // Generate authorization code
-  const code = createAuthorizationCode({
-    userId: authResult.user.id,
-    clientId: client_id,
-    redirectUri: redirect_uri,
-    scopes: scope.split(' '),
-    codeChallenge: code_challenge,
-    codeChallengeMethod: code_challenge_method,
-  });
-
-  // Clear OAuth params from session
-  delete req.session.oauthParams;
-
-  // Build redirect URL with authorization code
-  const redirectUrl = new URL(redirect_uri);
-  redirectUrl.searchParams.set('code', code);
-  if (state) {
-    redirectUrl.searchParams.set('state', state);
+  if (!oauthParams) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      error_description: 'OAuth session expired. Please start the authorization flow again.',
+    });
   }
 
-  // Return redirect URL (client-side JS will handle redirect)
-  res.json({
-    success: true,
-    redirectUrl: redirectUrl.toString(),
+  // SECURITY: Regenerate session after successful authentication to prevent session fixation
+  req.session.regenerate((err) => {
+    if (err) {
+      console.error('Session regeneration error:', err);
+      return res.status(500).json({
+        error: 'server_error',
+        error_description: 'Failed to establish secure session',
+      });
+    }
+
+    // Extract OAuth params
+    const {
+      client_id,
+      redirect_uri,
+      scope,
+      state,
+      code_challenge,
+      code_challenge_method,
+    } = oauthParams;
+
+    // Generate authorization code
+    const code = createAuthorizationCode({
+      userId: userId,
+      clientId: client_id,
+      redirectUri: redirect_uri,
+      scopes: scope.split(' '),
+      codeChallenge: code_challenge,
+      codeChallengeMethod: code_challenge_method,
+    });
+
+    // Build redirect URL with authorization code
+    const redirectUrl = new URL(redirect_uri);
+    redirectUrl.searchParams.set('code', code);
+    if (state) {
+      redirectUrl.searchParams.set('state', state);
+    }
+
+    // Return redirect URL (client-side JS will handle redirect)
+    res.json({
+      success: true,
+      redirectUrl: redirectUrl.toString(),
+    });
   });
 });
 
@@ -289,6 +309,35 @@ router.get('/error', (req: Request, res: Response) => {
 });
 
 /**
+ * Google OAuth Initiate - Store state in session
+ */
+router.post('/google/initiate', (req: Request, res: Response) => {
+  const { state } = req.body;
+
+  if (!state || typeof state !== 'string') {
+    return res.status(400).json({
+      error: 'invalid_request',
+      error_description: 'State parameter is required',
+    });
+  }
+
+  // SECURITY: Store state in session for CSRF protection
+  req.session.googleOAuthState = state;
+
+  req.session.save((err) => {
+    if (err) {
+      console.error('Session save error:', err);
+      return res.status(500).json({
+        error: 'server_error',
+        error_description: 'Failed to store session state',
+      });
+    }
+
+    res.json({ success: true });
+  });
+});
+
+/**
  * Google OAuth Callback Handler
  */
 router.get('/google/callback', async (req: Request, res: Response) => {
@@ -299,9 +348,25 @@ router.get('/google/callback', async (req: Request, res: Response) => {
     return res.redirect(`/oauth/error?error=access_denied&error_description=${encodeURIComponent('Google authentication was cancelled or failed')}`);
   }
 
-  // Validate state parameter (CSRF protection)
-  if (!state || !req.session.oauthParams) {
+  // SECURITY: Validate state parameter against stored session value (CSRF protection)
+  if (!state || typeof state !== 'string') {
+    return res.redirect('/oauth/error?error=invalid_request&error_description=Missing state parameter');
+  }
+
+  if (!req.session.googleOAuthState) {
     return res.redirect('/oauth/error?error=invalid_request&error_description=Session expired. Please try again.');
+  }
+
+  if (state !== req.session.googleOAuthState) {
+    console.error('Google OAuth CSRF attack detected: state mismatch');
+    return res.redirect('/oauth/error?error=access_denied&error_description=Invalid state parameter. Possible CSRF attack detected.');
+  }
+
+  // Clear the state from session after validation (one-time use)
+  delete req.session.googleOAuthState;
+
+  if (!req.session.oauthParams) {
+    return res.redirect('/oauth/error?error=invalid_request&error_description=OAuth session expired. Please try again.');
   }
 
   if (!code) {
@@ -343,46 +408,59 @@ router.get('/google/callback', async (req: Request, res: Response) => {
 
     const googleUser = await userInfoResponse.json() as { email: string };
 
-    // Authenticate or create user in PayloadCMS
-    // For now, we'll use the email from Google to authenticate
-    const authResult = await authenticateWithPayload(googleUser.email, '');
+    // For Google OAuth, we need to find the user by email (not authenticate with password)
+    // This should use findUserByEmail or a separate OAuth user lookup
+    const authResult = await findUserByEmail(googleUser.email);
 
     if (!authResult.success || !authResult.user) {
       return res.redirect(`/oauth/error?error=access_denied&error_description=${encodeURIComponent('No CashChat account found for this Google account. Please sign up first.')}`);
     }
 
-    // Extract OAuth params from session
-    const {
-      client_id,
-      redirect_uri,
-      scope,
-      state: oauthState,
-      code_challenge,
-      code_challenge_method,
-    } = req.session.oauthParams;
+    // Store OAuth params and user ID before regenerating session
+    const oauthParams = req.session.oauthParams;
+    const userId = authResult.user.id;
 
-    // Generate authorization code
-    const authCode = createAuthorizationCode({
-      userId: authResult.user.id,
-      clientId: client_id,
-      redirectUri: redirect_uri,
-      scopes: scope.split(' '),
-      codeChallenge: code_challenge,
-      codeChallengeMethod: code_challenge_method,
-    });
-
-    // Clear OAuth params from session
-    delete req.session.oauthParams;
-
-    // Build redirect URL with authorization code
-    const redirectUrl = new URL(redirect_uri);
-    redirectUrl.searchParams.set('code', authCode);
-    if (oauthState) {
-      redirectUrl.searchParams.set('state', oauthState);
+    if (!oauthParams) {
+      return res.redirect('/oauth/error?error=invalid_request&error_description=OAuth session expired. Please try again.');
     }
 
-    // Redirect back to Claude Desktop
-    res.redirect(redirectUrl.toString());
+    // SECURITY: Regenerate session after successful authentication to prevent session fixation
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error('Session regeneration error:', err);
+        return res.redirect('/oauth/error?error=server_error&error_description=Failed to establish secure session');
+      }
+
+      // Extract OAuth params
+      const {
+        client_id,
+        redirect_uri,
+        scope,
+        state: oauthState,
+        code_challenge,
+        code_challenge_method,
+      } = oauthParams;
+
+      // Generate authorization code
+      const authCode = createAuthorizationCode({
+        userId: userId,
+        clientId: client_id,
+        redirectUri: redirect_uri,
+        scopes: scope.split(' '),
+        codeChallenge: code_challenge,
+        codeChallengeMethod: code_challenge_method,
+      });
+
+      // Build redirect URL with authorization code
+      const redirectUrl = new URL(redirect_uri);
+      redirectUrl.searchParams.set('code', authCode);
+      if (oauthState) {
+        redirectUrl.searchParams.set('state', oauthState);
+      }
+
+      // Redirect back to Claude Desktop
+      res.redirect(redirectUrl.toString());
+    });
   } catch (error) {
     console.error('Google OAuth error:', error);
     return res.redirect('/oauth/error?error=server_error&error_description=Failed to authenticate with Google');
@@ -785,16 +863,40 @@ function generateLoginHTML(csrfToken: string): string {
 
     // Google Sign-In handler
     if (googleSignInBtn) {
-      googleSignInBtn.addEventListener('click', () => {
-        const googleAuthUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-        googleAuthUrl.searchParams.set('client_id', '${googleClientId}');
-        googleAuthUrl.searchParams.set('redirect_uri', '${serverUrl}/oauth/google/callback');
-        googleAuthUrl.searchParams.set('response_type', 'code');
-        googleAuthUrl.searchParams.set('scope', 'email profile');
-        googleAuthUrl.searchParams.set('access_type', 'offline');
-        googleAuthUrl.searchParams.set('state', Math.random().toString(36).substring(7));
+      googleSignInBtn.addEventListener('click', async () => {
+        // Generate and store state parameter in session for CSRF protection
+        const state = Math.random().toString(36).substring(2) + Date.now().toString(36);
 
-        window.location.href = googleAuthUrl.toString();
+        // Store state in session before redirecting
+        try {
+          const response = await fetch('/oauth/google/initiate', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ state }),
+          });
+
+          if (!response.ok) {
+            showError('Failed to initiate Google Sign-In. Please try again.');
+            return;
+          }
+
+          const data = await response.json();
+
+          // Redirect to Google OAuth with state parameter
+          const googleAuthUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+          googleAuthUrl.searchParams.set('client_id', '${googleClientId}');
+          googleAuthUrl.searchParams.set('redirect_uri', '${serverUrl}/oauth/google/callback');
+          googleAuthUrl.searchParams.set('response_type', 'code');
+          googleAuthUrl.searchParams.set('scope', 'email profile');
+          googleAuthUrl.searchParams.set('access_type', 'offline');
+          googleAuthUrl.searchParams.set('state', state);
+
+          window.location.href = googleAuthUrl.toString();
+        } catch (error) {
+          showError('Network error. Please check your connection and try again.');
+        }
       });
     }
 
